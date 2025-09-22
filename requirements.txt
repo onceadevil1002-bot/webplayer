@@ -1,0 +1,11 @@
+flask
+flask-cors
+yt-dlp
+redis>=4.5
+requests
+aiohttp
+beautifulsoup4
+python-dotenv
+httpx
+pydantic
+
