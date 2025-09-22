@@ -27,7 +27,9 @@ app = FastAPI()
 
 # Mount static files BEFORE other routes
 app.mount("/static", StaticFiles(directory="."), name="static")
-
+@app.get("/")
+async def root():
+    return {"status": "ok", "msg": "WebPlayer running"}
 # --- CORS ---
 app.add_middleware(
     CORSMiddleware,
