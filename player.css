@@ -1,0 +1,41 @@
+/* === KDRAMA Player Custom Styles === */
+
+/* General layout */
+body { margin:0; font-family:Arial, sans-serif; background:#111; color:#fff; }
+.topbar { display:flex; justify-content:space-between; align-items:center;
+  padding:12px; background:#000; }
+.branding { display:flex; align-items:center; gap:8px; }
+.branding span { background:#2a9df4; padding:6px 10px; border-radius:4px; font-weight:bold; }
+.channel { font-size:18px; font-weight:bold; }
+.btn { background:#222; padding:6px 10px; margin-left:6px; border:1px solid #333;
+       border-radius:4px; cursor:pointer; color:#fff; }
+.video-container { max-width:950px; margin:20px auto; }
+.servers, .downloads { max-width:950px; margin:10px auto; }
+.servers button, .downloads button {
+  margin:5px; padding:6px 12px; border-radius:6px; background:#333; color:#fff;
+  border:none; cursor:pointer;
+}
+.servers button.active { background:#2a9df4; }
+.error { color:#f66; margin-top:6px; }
+.vjs-control.custom-skip { font-size:14px; line-height:34px; padding:0 8px; cursor:pointer; }
+
+/* Fix for custom 3-dot menu */
+/* Style the MoreOptions (gear / 3-dot) button */
+/* Make sure MoreOptions button sits inline in the control bar */
+.vjs-control-bar .vjs-more-options {
+  position: relative !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 100% !important;
+  margin: 0 4px !important;
+  color: #fff;
+  font-size: 15px;
+}
+
+/* Icon inside (⋮ three dots) */
+.vjs-more-options .vjs-icon-placeholder:before {
+  content: "";
+  font-size: 20px;
+  line-height: 1;
+}
