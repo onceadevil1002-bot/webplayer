@@ -103,74 +103,60 @@ async def try_http_extract(session: aiohttp.ClientSession, vcloud_url: str) -> D
 
 async def playwright_extract(vcloud_url: str, timeout=20000) -> Dict[str,str]:
     """
-    Render-optimized Playwright extract with better browser launch args
+    Enhanced version of your original Playwright extract - SAME LOGIC, with ad blocking
     """
     results = {}
     try:
         async with async_playwright() as p:
-            # Render-specific browser launch configuration
+            # Enhanced browser launch with ad blocking
             browser = await p.chromium.launch(
-                headless=True,
+                headless=True, 
                 args=[
                     "--no-sandbox",
-                    "--disable-setuid-sandbox", 
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-zygote",
-                    "--single-process",
-                    "--disable-gpu",
-                    "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
-                    "--disable-extensions",
+                    "--disable-blink-features=AutomationControlled",
+                    "--block-new-web-contents",  # Block popups
+                    "--disable-extensions-except=/path/to/ublock",  # Would need uBlock path
+                    "--load-extension=/path/to/ublock",
                     "--disable-plugins",
-                    "--disable-images",
-                    "--disable-javascript",  # We may need JS, remove if issues
-                    "--memory-pressure-off",
-                    "--max_old_space_size=4096"
-                ],
-                # Use system chromium if available
-                executable_path=None,
-                ignore_default_args=["--enable-automation"]
+                    "--disable-images",  # Faster loading
+                ]
             )
             
             context = await browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
-                viewport={"width": 1280, "height": 720}
+                java_script_enabled=True
             )
             
             page = await context.new_page()
             
-            # Block resource-heavy content
+            # Block ads, images, and other resource types that slow things down
             await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}", lambda route: route.abort())
             await page.route("**/ads/**", lambda route: route.abort())
             await page.route("**/analytics/**", lambda route: route.abort())
+            await page.route("**/tracking/**", lambda route: route.abort())
+            await page.route("**/*google*ads*", lambda route: route.abort())
+            await page.route("**/*doubleclick*", lambda route: route.abort())
             
-            try:
-                await page.goto(vcloud_url, wait_until="domcontentloaded", timeout=timeout)
-            except Exception as e:
-                logger.error(f"Page navigation failed: {e}")
-                await browser.close()
-                return {}
+            await page.goto(vcloud_url, wait_until="domcontentloaded", timeout=timeout)
 
-            # Rest of your extraction logic remains the same...
+            # YOUR ORIGINAL BUTTON CLICKING LOGIC - enhanced
             btn_texts = ["generate", "get link", "download", "create link", "start", "watch"]
             for t in btn_texts:
                 try:
                     btn = await page.query_selector(f"button:has-text('{t}')") or await page.query_selector(f"a:has-text('{t}')")
                     if btn:
                         await btn.click(timeout=3000)
-                        await page.wait_for_timeout(1500)
+                        await page.wait_for_timeout(1500)  # Slightly longer wait
                         break
+                except PlaywrightTimeout:
+                    continue
                 except Exception:
                     continue
 
+            # Wait a bit more for dynamic content
             await page.wait_for_timeout(2000)
 
-            # Extract anchors
+            # YOUR ORIGINAL ANCHOR EXTRACTION LOGIC
             anchors = await page.query_selector_all("a")
             for a in anchors:
                 href = await a.get_attribute("href")
@@ -181,24 +167,23 @@ async def playwright_extract(vcloud_url: str, timeout=20000) -> Dict[str,str]:
                 if any(k in lowered for k in PREFERRED_SERVERS) or "pixeldrain" in href or "fsl" in href:
                     results[text.strip() or href] = href
 
-            # Extract sources
+            # YOUR ORIGINAL SOURCE TAG LOGIC
             sources = await page.query_selector_all("source")
             for s in sources:
                 src = await s.get_attribute("src")
                 if src:
                     results[f"source:{src[:30]}"] = src
 
-            # Regex search
+            # YOUR ORIGINAL REGEX SEARCH
             html = await page.content()
             for match in re.finditer(r"(https?://[^\s'\"<>]+(?:pixeldrain|fsl|pixel|10gbps|vcloud)[^\s'\"<>]*)", html, re.IGNORECASE):
                 results[match.group(1)[:40]] = match.group(1)
                 
             await browser.close()
-            
     except Exception as e:
         logger.exception("Playwright extraction error: %s", e)
-    
     return results
+
 
 async def scrape_vcloud(url: str, prefer_fast=True, max_retries=2) -> Dict[str,str]:
     """
