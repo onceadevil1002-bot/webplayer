@@ -1,10 +1,11 @@
-# server.py (fixed version)
+# server.py (fixed version with lifespan)
 import os
 import uvicorn
 import asyncio
 import logging
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,14 +23,34 @@ from scraper import scrape_vcloud
 logger = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO)
 
-# --- App & static ---
-app = FastAPI()
+# --- Lifespan context manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting auto-scraper background task...")
+    task = asyncio.create_task(auto_scraper.run_auto_scraper())
+    
+    yield  # Application is running
+    
+    # Shutdown
+    logger.info("Shutting down auto-scraper...")
+    auto_scraper.stop()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+# --- App initialization ---
+app = FastAPI(lifespan=lifespan)
 
 # Mount static files BEFORE other routes
 app.mount("/static", StaticFiles(directory="."), name="static")
+
 @app.get("/")
 async def root():
     return {"status": "ok", "msg": "WebPlayer running"}
+
 # --- CORS ---
 app.add_middleware(
     CORSMiddleware,
@@ -68,8 +89,12 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
     }
     .servers button:hover, .downloads button:hover, .downloads a:hover { background:#444; }
     .servers button.active { background:#2a9df4; }
+    .downloads a { background:#2d5a2d; }
+    .downloads a:hover { background:#3d6a3d; }
     .error { color:#f66; margin-top:6px; }
     .status { color:#4a9; margin:10px; }
+    .server-count { color:#4a9; font-size:14px; margin:5px 0; }
+    .warning { color:#ff9500; margin:10px; padding:8px; background:#2a1f0a; border-radius:4px; }
     #videoPlayer { width: 100%; height: 500px; }
   </style>
   <link href="https://vjs.zencdn.net/7.21.1/video-js.css" rel="stylesheet">
@@ -94,8 +119,10 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
 
   <div class="servers">
     <h3>Servers</h3>
+    <div id="server-count" class="server-count"></div>
     <div id="servers"></div>
     <div id="status" class="status"></div>
+    <div id="warning" class="warning" style="display:none;"></div>
   </div>
 
   <div class="downloads">
@@ -132,9 +159,24 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
         const serversDiv = document.getElementById("servers");
         const downloadsDiv = document.getElementById("downloads");
         const statusDiv = document.getElementById("status");
+        const serverCountDiv = document.getElementById("server-count");
+        const warningDiv = document.getElementById("warning");
         
         serversDiv.innerHTML = "";
         downloadsDiv.innerHTML = "";
+        warningDiv.style.display = "none";
+
+        // Handle server count and warnings
+        if (data.server_info) {
+            serverCountDiv.innerText = `Servers: ${data.server_info.server_count}/9`;
+            
+            if (data.server_info.needs_force_scrape) {
+                warningDiv.innerText = data.server_info.message;
+                warningDiv.style.display = "block";
+            } else {
+                warningDiv.style.display = "none";
+            }
+        }
 
         // Initialize player once
         if (!player) {
@@ -175,7 +217,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
 
         let hasAnyServers = false;
 
-        // Process cached links
+        // Process cached links - CREATE BOTH SERVER AND DOWNLOAD BUTTONS FOR EACH SERVER
         for (const [quality, servers] of Object.entries(links)) {
           console.log(`Processing ${quality}:`, servers);
           
@@ -184,7 +226,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
             continue;
           }
 
-          // Create server buttons
+          // Create server buttons (for playback)
           for (const [serverName, link] of Object.entries(servers)) {
             if (!link) continue;
             
@@ -210,14 +252,13 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
             serversDiv.appendChild(btn);
           }
 
-          // Create download button (use first available server for that quality)
-            // Create download buttons (one for each server)
+          // Create download buttons (one for each server - SAME AS SERVER BUTTONS)
           for (const [serverName, link] of Object.entries(servers)) {
             if (!link) continue;
             
             const a = document.createElement("a");
             a.href = link;
-            a.innerText = `${quality}p (${serverName})`;
+            a.innerText = `${quality}p (${serverName})`;  // EXACTLY same text as server button
             a.className = "btn";
             a.setAttribute("download", "");
             a.target = "_blank";
@@ -282,7 +323,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
         return;
       }
 
-      document.getElementById("status").innerText = "🔄 Scraping...";
+      document.getElementById("status").innerText = "🔥 Scraping...";
 
       try {
         const res = await fetch(`/scrape?show=${encodeURIComponent(show)}&ep=${encodeURIComponent(ep)}`);
@@ -452,14 +493,7 @@ async def get_link(show: str = Query(...), ep: int = Query(...)):
         "server_info": server_info
     }
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting auto-scraper background task...")
-    asyncio.create_task(auto_scraper.run_auto_scraper())
 
-@app.on_event("shutdown") 
-async def shutdown_event():
-    auto_scraper.stop()
 @app.post("/admin/add_episode")
 async def admin_add_episode(
     show: str = Form(...), ep: int = Form(...),
