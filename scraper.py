@@ -101,7 +101,7 @@ async def try_http_extract(session: aiohttp.ClientSession, vcloud_url: str) -> D
     return valid
 
 
-async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
+async def playwright_extract(vcloud_url: str, timeout=90000) -> Dict[str, str]:
     results = {}
     try:
         async with async_playwright() as p:
@@ -113,10 +113,11 @@ async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--disable-software-rasterizer"
+                    "--disable-software-rasterizer",
+                    "--single-process",
+                    "--disable-accelerated-2d-canvas"
                 ]
             )
-            
             context = await browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
                 java_script_enabled=True
@@ -124,9 +125,14 @@ async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
             page = await context.new_page()
 
             logger.info(f"Navigating to {vcloud_url}")
-            await page.goto(vcloud_url, wait_until="domcontentloaded", timeout=timeout)
+            await page.goto(vcloud_url, wait_until="networkidle", timeout=timeout)
 
-            # try clicking known buttons
+            # Debug snapshot + screenshot
+            html = await page.content()
+            logger.info("PAGE SNAPSHOT (first 500 chars): %s", html[:500])
+            await page.screenshot(path="/tmp/page.png", full_page=True)
+
+            # Try clicking buttons
             for t in ["generate", "get link", "download", "create link", "start", "watch"]:
                 try:
                     btn = await page.query_selector(f"text={t}")
@@ -138,11 +144,10 @@ async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
                 except Exception:
                     continue
 
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
-            # extract anchors
-            anchors = await page.query_selector_all("a")
-            for a in anchors:
+            # Extract anchors
+            for a in await page.query_selector_all("a"):
                 href = await a.get_attribute("href")
                 if href:
                     text = (await a.inner_text() or "").lower()
@@ -150,14 +155,13 @@ async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
                     if any(k in lowered for k in PREFERRED_SERVERS):
                         results[text.strip() or href] = href
 
-            # extract <source> tags
+            # Extract sources
             for s in await page.query_selector_all("source"):
                 src = await s.get_attribute("src")
                 if src:
                     results[f"source:{src[:30]}"] = src
 
-            # regex fallback
-            html = await page.content()
+            # Regex fallback
             for match in re.finditer(
                 r"(https?://[^\s'\"<>]+(?:pixeldrain|fsl|pixel|10gbps|vcloud)[^\s'\"<>]*)",
                 html, re.IGNORECASE
@@ -168,7 +172,6 @@ async def playwright_extract(vcloud_url: str, timeout=45000) -> Dict[str, str]:
     except Exception as e:
         logger.exception("Playwright extraction error: %s", e)
     return results
-
 
 async def scrape_vcloud(url: str, prefer_fast=True, max_retries=2) -> Dict[str,str]:
     """
