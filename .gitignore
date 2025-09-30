@@ -1,0 +1,9 @@
+pycache/
+*.pyc
+*.log
+*.sqlite3
+.env
+start.sh
+start.bat
+render-build.sh
+docker-compose.yml

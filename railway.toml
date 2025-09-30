@@ -1,0 +1,10 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+startCommand = "sh -c 'uvicorn server:app --host 0.0.0.0 --port $PORT'"
+restartPolicyType = "ON_FAILURE"
+
+[env]
+PORT = "8000"
+PYTHONUNBUFFERED = "1"
