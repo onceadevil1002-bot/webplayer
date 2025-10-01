@@ -22,16 +22,15 @@ from scraper import scrape_vcloud
 
 logger = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO)
-
 # --- Lifespan context manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting auto-scraper background task...")
     task = asyncio.create_task(auto_scraper.run_auto_scraper())
-    
+
     yield  # Application is running
-    
+
     # Shutdown
     logger.info("Shutting down auto-scraper...")
     auto_scraper.stop()
@@ -43,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 # --- App initialization ---
 app = FastAPI(lifespan=lifespan)
+scrape_lock = asyncio.Lock()
 
 # Mount static files BEFORE other routes
 app.mount("/static", StaticFiles(directory="."), name="static")
@@ -450,21 +450,23 @@ async def scrape_handler(show: str = Query(...), ep: int = Query(...)):
     master = doc.get("master", {})
     scraped = {}
 
-    for q, url in master.items():
-        print(f"🔍 Scraping {q}p from {url}")
-        try:
-            res = await scrape_vcloud(url)
-            if res:
-                scraped[q] = res
-                print(f"✅ {q}p -> {len(res)} servers found")
-            else:
-                scraped[q] = {}
-                print(f"⚠️ {q}p -> no servers found")
-        except Exception as e:
-            scraped[q] = {}
-            print(f"❌ {q}p -> error: {e}")
+    async with scrape_lock:
+        
+      for q, url in master.items():
+          print(f"🔍 Scraping {q}p from {url}")
+          try:
+              res = await scrape_vcloud(url)
+              if res:
+                  scraped[q] = res
+                  print(f"✅ {q}p -> {len(res)} servers found")
+              else:
+                  scraped[q] = {}
+                  print(f"⚠️ {q}p -> no servers found")
+          except Exception as e:
+              scraped[q] = {}
+              print(f"❌ {q}p -> error: {e}")
 
-    await set_cached(ep_id, scraped, ttl=3600)
+      await set_cached(ep_id, scraped, ttl=3600)
     return {"status": "ok", "servers": scraped}
 
 
