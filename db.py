@@ -1,7 +1,7 @@
 # db.py
 import motor.motor_asyncio
 import os
-import datetime
+from datetime import datetime, timedelta, timezone
 
 MONGO_URI = os.getenv(
     "MONGO_URI",
@@ -9,7 +9,11 @@ MONGO_URI = os.getenv(
 )
 DB_NAME = os.getenv("MONGO_DB", "kdrama")
 
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+client = motor.motor_asyncio.AsyncIOMotorClient(
+    MONGO_URI,
+    tz_aware=True,   # ✅ ensures datetimes come back as timezone-aware
+    tzinfo=timezone.utc
+)
 db = client[DB_NAME]
 
 episodes_collection = db["episodes"]   # permanent episode records (master links)
@@ -20,10 +24,9 @@ jobs_collection = db["jobs"]           # track transcoding jobs (progress, credi
 async def add_episode(ep_id: str, master_links: dict):
     await episodes_collection.update_one(
         {"_id": ep_id},
-        {"$set": {"master": master_links, "createdAt": datetime.datetime.utcnow()}},
+        {"$set": {"master": master_links, "createdAt": datetime.now(timezone.utc)}},  # ✅ FIXED
         upsert=True
     )
-
 
 async def get_episode(ep_id: str):
     return await episodes_collection.find_one({"_id": ep_id})
@@ -47,11 +50,13 @@ async def set_cached(ep_id: str, links: dict, ttl: int = 3600):
             merged[quality] = servers
         else:
             merged[quality].update(servers)
+    
     print(f"💾 Merging {ep_id}: {sum(len(v) for v in old_links.values())} -> {sum(len(v) for v in merged.values())} total servers")
+    
     update_doc = {
         "links": merged,
-        "updatedAt": datetime.datetime.utcnow(),
-        "expireAt": datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)
+        "updatedAt": datetime.now(timezone.utc),  # Changed from datetime.now(timezone.utc)
+        "expireAt": datetime.now(timezone.utc) + timedelta(seconds=ttl)  # Changed
     }
 
     print(f"💾 Caching {ep_id}: {sum(len(v) for v in merged.values())} total servers")

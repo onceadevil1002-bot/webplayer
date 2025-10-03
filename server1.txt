@@ -36,52 +36,89 @@ _global_browser = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """LAZY BROWSER: Only keep playwright alive, not browser"""
-    global _global_playwright
+    """FIXED: Proper lifespan with global browser setup"""
+    global _global_playwright, _global_browser
     
     # STARTUP
-    logger.info("Starting Playwright (lazy browser mode)...")
+    logger.info("Starting Playwright and background tasks...")
 
     try:
         _global_playwright = await async_playwright().start()
+        _global_browser = await _global_playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ]
+        )
         
-        # Register playwright in scraper.py (NOT browser)
-        scraper.set_playwright(_global_playwright)
-        logger.info("✅ Global playwright registered (lazy browser mode)")
+        # Register global browser in scraper.py
+        scraper.set_browser(_global_playwright, _global_browser)
+        logger.info("âœ… Global Playwright/browser registered successfully")
         
     except Exception as e:
-        logger.exception(f"Failed to start playwright: {e}")
+        logger.exception(f"Failed to start global Playwright/browser: {e}")
 
     # Initialize app state
     app.state.scrape_lock = asyncio.Lock()
     app.state.scrape_queue = asyncio.Queue()
     app.state.queued_episodes = set()
 
-    # Start background tasks (NO browser heartbeat needed)
+    # Start ALL background tasks
     task_auto = asyncio.create_task(auto_scraper.run_auto_scraper())
     queue_task = asyncio.create_task(_queue_worker(app))
+    heartbeat_task = asyncio.create_task(_browser_heartbeat())  # â† FIX: START HEARTBEAT
 
     yield  # Application running
 
     # SHUTDOWN
-    logger.info("Shutting down background tasks...")
+    logger.info("Shutting down background tasks and Playwright...")
     auto_scraper.stop()
     
-    # Cancel background tasks
+    # Cancel ALL background tasks
     task_auto.cancel()
     queue_task.cancel()
+    heartbeat_task.cancel()  # â† FIX: STOP HEARTBEAT
     
-    # Wait for tasks to finish
-    await asyncio.gather(task_auto, queue_task, return_exceptions=True)
+    # Wait for all tasks to finish cancelling
+    await asyncio.gather(task_auto, queue_task, heartbeat_task, return_exceptions=True)
 
     try:
+        if _global_browser:
+            await _global_browser.close()
         if _global_playwright:
             await _global_playwright.stop()
     except Exception as e:
-        logger.warning(f"Error stopping playwright: {e}")
+        logger.warning(f"Error closing Playwright/browser: {e}")
 
     # Unset in scraper
-    scraper.set_playwright(None)
+    scraper.set_browser(None, None)
+
+# ADD THIS NEW FUNCTION RIGHT AFTER THE LIFESPAN FUNCTION
+async def _browser_heartbeat():
+    """Background task to keep browser alive proactively"""
+    while True:
+        await asyncio.sleep(180)  # Check every 3 minutes
+        try:
+            # Get current browser (this will do health check if needed)
+            browser = await scraper.get_browser()
+            if browser:
+                # Quick health verification - open and close a context
+                context = await browser.new_context()
+                await context.close()
+                logger.debug("âœ… Browser heartbeat check passed")
+            else:
+                logger.warning("💢 Browser heartbeat: no browser available")
+        except Exception as e:
+            logger.warning(f"âš ï¸ Browser heartbeat failed: {e}")
+            # Don't panic - the next scrape will trigger browser restart
+
 
 # Initialize FastAPI with lifespan
 app = FastAPI(lifespan=lifespan)
@@ -105,26 +142,39 @@ async def _queue_worker(app):
     """
     q = app.state.scrape_queue
     queued_set = app.state.queued_episodes
-
+    
     while True:
         ep_id = None
         try:
             ep_id, show, ep = await q.get()
             logger.info(f"⭕ Queue worker: processing {ep_id}")
-
+            
             # Remove from queued set now that we're processing
             queued_set.discard(ep_id)
-
+            
+            # Check if cache already exists and is fresh (PER EPISODE)
+            cached = await get_cached(ep_id)
+            if cached:
+                cache_doc = await cache_collection.find_one({"_id": ep_id})
+                if cache_doc:
+                    expire_at = cache_doc.get("expireAt")
+                    current_time = datetime.now(timezone.utc)  # FIXED
+                    if expire_at and expire_at > current_time:
+                        time_remaining = (expire_at - current_time).total_seconds() / 60
+                        if time_remaining > 10:  # More than 10 minutes remaining
+                            logger.info(f"⏭️  Skipping {ep_id} - cache is still fresh ({time_remaining:.1f} minutes remaining)")
+                            continue
+            
             # Use lock to ensure only one scrape runs at a time
             async with app.state.scrape_lock:
                 doc = await get_episode(ep_id)
                 if not doc:
                     logger.warning(f"Episode missing in queue_worker: {ep_id}")
                     continue
-
+                
                 master = doc.get("master", {})
                 scraped = {}
-
+                
                 for quality, url in master.items():
                     try:
                         logger.info(f"⭕ Scraping {quality}p from {url}")
@@ -134,11 +184,11 @@ async def _queue_worker(app):
                     except Exception as e:
                         logger.error(f"❌ {quality}p error: {e}")
                         scraped[quality] = {}
-
+                
                 # Increase cache TTL to 6 hours (21600 seconds)
                 await set_cached(ep_id, scraped, ttl=21600)
                 logger.info(f"✅ Queue worker: cached results for {ep_id}")
-
+                
         except Exception as e:
             logger.exception(f"Queue worker loop error: {e}")
         finally:
@@ -187,42 +237,6 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
     .server-count { color:#4a9; font-size:14px; margin:5px 0; }
     .warning { color:#ff9500; margin:10px; padding:8px; background:#2a1f0a; border-radius:4px; }
     #videoPlayer { width: 100%; height: 500px; }
-
-    /* Popup styles */
-    .popup {
-        display: none;
-        position: fixed;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        background-color: rgba(0, 0, 0, 0.9);
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        z-index: 1000;
-        text-align: center;
-        box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
-        max-width: 400px;
-    }
-
-    .popup h3 {
-        margin-top: 0;
-        color: #2a9df4;
-    }
-
-    .popup button {
-        background-color: #2a9df4;
-        color: white;
-        border: none;
-        padding: 10px 20px;
-        border-radius: 5px;
-        cursor: pointer;
-        margin-top: 15px;
-    }
-
-    .popup button:hover {
-        background-color: #1e78c8;
-    }
   </style>
   <link href="https://vjs.zencdn.net/7.21.1/video-js.css" rel="stylesheet">
 </head>
@@ -239,9 +253,11 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
       <button class="btn" onclick="refreshPage()">Refresh</button>
     </div>
   </div>
+
   <div class="video-container">
     <video id="videoPlayer" class="video-js vjs-default-skin" controls preload="auto" width="950" height="500"></video>
   </div>
+
   <div class="servers">
     <h3>Servers</h3>
     <div id="server-count" class="server-count"></div>
@@ -249,96 +265,57 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
     <div id="status" class="status"></div>
     <div id="warning" class="warning" style="display:none;"></div>
   </div>
+
   <div class="downloads">
     <h3>Download</h3>
     <div id="downloads"></div>
-  </div>
-
-  <!-- Cooldown Popup -->
-  <div id="cooldownPopup" class="popup">
-      <h3>🕒 Please Be Patient</h3>
-      <p>Our system is working hard to fetch the best links for you.</p>
-      <p id="cooldownMessage">You can force scrape again in <span id="cooldownTime">10:00</span> minutes.</p>
-      <button onclick="closePopup()">OK</button>
   </div>
 
   <script src="https://vjs.zencdn.net/7.21.1/video.min.js"></script>
   <script>
     let currentLink = null;
     let player = null;
-    let cooldownInterval;
-
-    function showCooldownPopup(minutes) {
-        const popup = document.getElementById('cooldownPopup');
-        const cooldownTimeElement = document.getElementById('cooldownTime');
-        cooldownTimeElement.textContent = `${Math.floor(minutes)}:00`;
-        popup.style.display = 'block';
-
-        // Clear any existing interval
-        if (cooldownInterval) {
-            clearInterval(cooldownInterval);
-        }
-
-        let remainingTime = minutes * 60; // Convert to seconds
-
-        cooldownInterval = setInterval(() => {
-            remainingTime--;
-            let displayMinutes = Math.floor(remainingTime / 60);
-            let displaySeconds = remainingTime % 60;
-            cooldownTimeElement.textContent = `${displayMinutes}:${displaySeconds < 10 ? '0' : ''}${displaySeconds}`;
-
-            if (remainingTime <= 0) {
-                clearInterval(cooldownInterval);
-                notifyCooldownOver();
-            }
-        }, 1000);
-    }
-
-    function notifyCooldownOver() {
-        alert("Cooldown is over! You can now force scrape again.");
-        closePopup();
-    }
-
-    function closePopup() {
-        document.getElementById('cooldownPopup').style.display = 'none';
-    }
 
     async function loadEpisode() {
-      // Existing loadEpisode function
       try {
         const params = new URLSearchParams(window.location.search);
         const show = params.get("show");
         const ep = params.get("ep");
+
         if (!show || !ep) {
           document.getElementById("servers").innerText = "💦 Missing show/ep params";
           return;
         }
+
         document.getElementById("status").innerText = "Loading episode data...";
 
         const res = await fetch(`/get_link?show=${encodeURIComponent(show)}&ep=${encodeURIComponent(ep)}`);
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}: ${res.statusText}`);
         }
-
+        
         let data = await res.json();
         console.log("Episode data:", data);
+
         const serversDiv = document.getElementById("servers");
         const downloadsDiv = document.getElementById("downloads");
         const statusDiv = document.getElementById("status");
         const serverCountDiv = document.getElementById("server-count");
         const warningDiv = document.getElementById("warning");
-
+        
         serversDiv.innerHTML = "";
         downloadsDiv.innerHTML = "";
         warningDiv.style.display = "none";
+
         if (data.server_info) {
             serverCountDiv.innerText = `Servers: ${data.server_info.server_count}/9`;
-
+            
             if (data.server_info.needs_force_scrape) {
                 warningDiv.innerText = data.server_info.message;
                 warningDiv.style.display = "block";
             }
         }
+
         if (!player) {
           player = videojs("videoPlayer", {
             fluid: true,
@@ -346,12 +323,13 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
             playbackRates: [0.5, 1, 1.25, 1.5, 2]
           });
         }
+
         let links = {};
         if (data.status === "cached" && data.links) {
           links = data.links;
-          statusDiv.innerText = "✅ Cached links loaded";
+          statusDiv.innerText = "âœ… Cached links loaded";
         } else if (data.status === "master" && data.links) {
-          statusDiv.innerText = "⚠️ Only master links found. Click 'Force Scrape' to get direct links.";
+          statusDiv.innerText = "âš ï¸ Only master links found. Click 'Force Scrape' to get direct links.";
           for (const [quality, masterUrl] of Object.entries(data.links)) {
             const btn = document.createElement("button");
             btn.innerText = `${quality}p (Master)`;
@@ -367,12 +345,15 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
           statusDiv.innerText = "💢 No links found";
           return;
         }
+
         let hasAnyServers = false;
+
         for (const [quality, servers] of Object.entries(links)) {
           if (!servers || typeof servers !== 'object') continue;
+
           for (const [serverName, link] of Object.entries(servers)) {
             if (!link) continue;
-
+            
             hasAnyServers = true;
             const btn = document.createElement("button");
             btn.innerText = `${quality}p (${serverName})`;
@@ -388,6 +369,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
             };
             serversDiv.appendChild(btn);
           }
+
           for (const [serverName, link] of Object.entries(servers)) {
             if (!link) continue;
             const a = document.createElement("a");
@@ -399,6 +381,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
             downloadsDiv.appendChild(a);
           }
         }
+
         if (hasAnyServers) {
           const qualityOrder = ["1080", "720", "480"];
           for (const q of qualityOrder) {
@@ -409,7 +392,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
                 player.src({ src: firstServer, type: "video/mp4" });
                 const firstBtn = serversDiv.querySelector('button');
                 if (firstBtn) firstBtn.classList.add('active');
-                statusDiv.innerText = `✅ Ready to play ${q}p`;
+                statusDiv.innerText = `âœ… Ready to play ${q}p`;
                 break;
               }
             }
@@ -417,6 +400,7 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
         } else {
           statusDiv.innerText = "💢 No playable servers found";
         }
+
       } catch (err) {
         console.error("Load error:", err);
         document.getElementById("status").innerHTML = `💢 Error: ${err.message}`;
@@ -433,10 +417,12 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
       else alert("No video selected");
     }
 
+    // In the forceScrap() function - this should already work correctly
     async function forceScrap() {
       const params = new URLSearchParams(window.location.search);
       const show = params.get("show");
       const ep = params.get("ep");
+
       if (!show || !ep) {
         alert("Missing show/ep parameters");
         return;
@@ -452,11 +438,10 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
           document.getElementById("status").innerText = "⏳ Scraping queued, please wait 30 seconds then refresh...";
           setTimeout(() => loadEpisode(), 30000);
         } else if (data.status === "cooldown") {
-          // Extract remaining time safely with null check
-          const remainingTimeMatch = data.message.match(/(\d+\.\d+) minutes/);
-          const remainingTime = remainingTimeMatch ? parseFloat(remainingTimeMatch[1]) : 10;
-          showCooldownPopup(remainingTime);
           document.getElementById("status").innerText = "⏳ " + data.message;
+          // Auto-refresh when cooldown is over (check every minute)
+          const waitTime = 60000;
+          setTimeout(() => loadEpisode(), waitTime);
         } else if (data.status === "already_queued") {
           document.getElementById("status").innerText = "⏳ " + data.message;
         } else {
@@ -479,8 +464,6 @@ async def player_page(show: str = Query(...), ep: int = Query(...)):
 </body>
 </html>'''
     return HTMLResponse(html_content)
-
-
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -566,13 +549,6 @@ async def admin_page():
     return HTMLResponse(html)
 
 
-
-# Global dictionary to track last scrape times for each episode
-last_scrape_times = {}
-
-
-
-
 @app.get("/scrape")
 async def scrape_handler(show: str = Query(...), ep: int = Query(...)):
     """Queue-based scraping with PER-EPISODE 10-minute cooldown"""
@@ -581,32 +557,31 @@ async def scrape_handler(show: str = Query(...), ep: int = Query(...)):
     if not doc:
         raise HTTPException(status_code=404, detail="Episode not found")
 
-    # Check if the episode is already queued
+    # Check cache freshness - enforce 10-minute cooldown PER EPISODE
+    cached = await get_cached(ep_id)
+    if cached:
+        cache_doc = await cache_collection.find_one({"_id": ep_id})
+        if cache_doc:
+            expire_at = cache_doc.get("expireAt")
+            current_time = datetime.now(timezone.utc)  # FIXED: Use timezone-aware UTC
+            if expire_at and expire_at > current_time:
+                time_remaining = (expire_at - current_time).total_seconds() / 60
+                if time_remaining > 10:  # More than 10 minutes remaining
+                    return {
+                        "status": "cooldown", 
+                        "message": f"Cache is still fresh for this episode. Please wait {time_remaining:.1f} minutes before scraping again."
+                    }
+
+    # Check if already queued (PER EPISODE)
     if ep_id in app.state.queued_episodes:
         return {"status": "already_queued", "message": f"This episode is already in the scrape queue"}
 
-    # Check if the last scrape was less than 10 minutes ago
-    last_scrape_time = last_scrape_times.get(ep_id)
-    if last_scrape_time:
-        current_time = datetime.now(timezone.utc)
-        time_elapsed = (current_time - last_scrape_time).total_seconds() / 60  # Convert to minutes
-        if time_elapsed < 10:
-            remaining_time = 10 - time_elapsed
-            return {
-                "status": "cooldown",
-                "message": f"Please wait {remaining_time:.1f} minutes before scraping again."
-            }
-
-    # Update the last scrape time
-    last_scrape_times[ep_id] = datetime.now(timezone.utc)
-
-    # Add to queue and track it
+    # Add to queue and track it (PER EPISODE)
     app.state.queued_episodes.add(ep_id)
     await app.state.scrape_queue.put((ep_id, show, ep))
-
+    
     logger.info(f"✅ Scrape queued for {ep_id} - other episodes can still be scraped")
     return {"status": "queued", "message": "Scrape queued; will run shortly"}
-
 
 
 @app.get("/get_link")
